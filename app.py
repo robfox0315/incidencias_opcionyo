@@ -14,6 +14,7 @@ import plotly.express as px
 import streamlit as st
 
 import data_loader as dl
+import hubspot_api as hs
 
 # ---------------------------------------------------------------------
 OY_TEAL, OY_BLUE, OY_DARK, OY_GREY = "#16B6C2", "#2F80ED", "#0E2A47", "#6B7280"
@@ -21,10 +22,23 @@ OK_GREEN, WARN_RED, WARN_AMBER = "#27AE60", "#E74C3C", "#F39C12"
 PALETA = [OY_TEAL, OY_BLUE, "#7C4DFF", OK_GREEN, WARN_AMBER, WARN_RED,
           "#00BFA5", "#5C6BC0", "#FF8A65", "#26A69A", "#AB47BC", "#78909C"]
 
-DATA_DIR = Path(__file__).parent / "data"
-SAMPLE_TICKETS = DATA_DIR / "problemas_tecnicos_mayo.csv"
-SAMPLE_ESP = DATA_DIR / "incidencias_especialistas_mayo.csv"
-SAMPLE_PRUEBAS = DATA_DIR / "seguimiento_pruebas_mayo.csv"
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+
+
+def _buscar_dato(nombre):
+    """Busca un CSV de muestra en data/ y, si no, en la raíz del repo.
+    Devuelve la ruta (str) o None. Tolera que al subir a GitHub el archivo
+    haya quedado fuera de la carpeta data/."""
+    for cand in (DATA_DIR / nombre, BASE_DIR / nombre):
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+SAMPLE_TICKETS = _buscar_dato("problemas_tecnicos_mayo.csv")
+SAMPLE_ESP = _buscar_dato("incidencias_especialistas_mayo.csv")
+SAMPLE_PRUEBAS = _buscar_dato("seguimiento_pruebas_mayo.csv")
 
 st.set_page_config(page_title="Incidencias Técnicas · Opción Yo",
                    page_icon="🛠️", layout="wide", initial_sidebar_state="expanded")
@@ -113,6 +127,13 @@ def donut(d, names, values, colores=None):
 
 
 # ---------------------------------------------------------------------
+@st.cache_data(show_spinner="Trayendo tickets de HubSpot…", ttl=900)
+def _tickets_hubspot(token: str) -> pd.DataFrame:
+    """Trae tickets en vivo y los enriquece. Cache 15 min (ttl=900)."""
+    crudo = hs.cargar_desde_hubspot(token)
+    return dl.enriquecer_tickets(crudo)
+
+
 @st.cache_data(show_spinner=False)
 def _tk(ruta): return dl.cargar_tickets(ruta)
 @st.cache_data(show_spinner=False)
@@ -128,17 +149,59 @@ with st.sidebar:
     st.markdown("### 🛠️ Incidencias Técnicas")
     st.caption("Opción Yo · Área de Incidencias")
     st.divider()
-    st.markdown("**1 · Fuente de datos (HubSpot)**")
-    subido = st.file_uploader("Sube el export de HubSpot (.xlsx o .csv)",
-                              type=["xlsx", "xls", "csv"], key="up_tickets")
-    if subido is not None:
-        df = dl.cargar_tickets(subido)
-        st.success(f"✅ {subido.name} ({len(df)} tickets)")
-    elif SAMPLE_TICKETS.exists():
-        df = _tk(str(SAMPLE_TICKETS))
-        st.info(f"📄 Muestra incluida ({len(df)} tickets).")
+    st.markdown("**1 · Fuente de datos**")
+    hay_token = "HUBSPOT_TOKEN" in st.secrets
+    opciones_fuente = ["🔌 HubSpot en vivo", "📁 Archivo (CSV/Excel)"]
+    fuente = st.radio("¿De dónde traigo los tickets?", opciones_fuente,
+                      index=0 if hay_token else 1)
+
+    df = None
+    origen_txt = ""
+    if fuente == "🔌 HubSpot en vivo":
+        if not hay_token:
+            st.warning("No hay token configurado. Agrégalo en **Settings → Secrets** "
+                       "como `HUBSPOT_TOKEN` (ver README). Uso la muestra por ahora.")
+            if SAMPLE_TICKETS is not None:
+                df = _tk(SAMPLE_TICKETS); origen_txt = "muestra local"
+        else:
+            token = st.secrets["HUBSPOT_TOKEN"]
+            colb1, colb2 = st.columns(2)
+            probar = colb1.button("Probar conexión", use_container_width=True)
+            recargar = colb2.button("🔄 Recargar", use_container_width=True)
+            if probar:
+                ok, msg = hs.probar_conexion(token)
+                (st.success if ok else st.error)(msg)
+            if recargar:
+                st.cache_data.clear()
+            try:
+                df = _tickets_hubspot(token)
+                origen_txt = "HubSpot en vivo"
+                st.success(f"✅ {len(df)} tickets desde HubSpot")
+            except Exception as e:
+                st.error(f"⚠️ No pude traer datos de HubSpot: {e}")
+                if SAMPLE_TICKETS is not None:
+                    st.info("Muestro la **muestra incluida** mientras tanto.")
+                    df = _tk(SAMPLE_TICKETS); origen_txt = "muestra local"
     else:
-        st.error("Sube el export de HubSpot para continuar."); st.stop()
+        st.caption("Usa el export de **'problemas técnicos'**.")
+        subido = st.file_uploader("Sube el export (.xlsx o .csv)",
+                                  type=["xlsx", "xls", "csv"], key="up_tickets")
+        if subido is not None:
+            try:
+                df = dl.cargar_tickets(subido); origen_txt = subido.name
+                st.success(f"✅ {subido.name} ({len(df)} tickets)")
+            except Exception as e:
+                st.error(f"⚠️ {e}")
+                if SAMPLE_TICKETS is not None:
+                    st.info("Sigo con la **muestra incluida**.")
+                    df = _tk(SAMPLE_TICKETS); origen_txt = "muestra local"
+        elif SAMPLE_TICKETS is not None:
+            df = _tk(SAMPLE_TICKETS); origen_txt = "muestra local"
+            st.info(f"📄 Muestra incluida ({len(df)} tickets).")
+
+    if df is None:
+        st.error("No hay datos disponibles. Configura HubSpot o sube un archivo.")
+        st.stop()
 
     st.divider()
     st.markdown("**2 · Filtro principal · SIN RESPUESTA**")
@@ -154,6 +217,19 @@ with st.sidebar:
     est_sel = st.multiselect("Estado del ticket", sorted(df["estado"].fillna("Sin dato").unique()),
                              default=sorted(df["estado"].fillna("Sin dato").unique()))
 
+    # --- Filtro de PERIODO (mes) ---
+    # Responde a: "¿puedo ver solo el último mes sin usar archivo?" -> Sí, en vivo.
+    st.markdown("**4 · Periodo**")
+    _base_fecha = "fecha_creacion" if ("fecha_creacion" in df.columns and
+                                       df["fecha_creacion"].notna().any()) else "fecha_cierre"
+    _fechas = pd.to_datetime(df[_base_fecha], errors="coerce")
+    _meses = sorted([m for m in _fechas.dt.strftime("%Y-%m").dropna().unique()], reverse=True)
+    mes_sel = st.selectbox(
+        f"Mes (según {'creación' if _base_fecha=='fecha_creacion' else 'cierre'})",
+        ["Todos"] + _meses,
+        help="Con HubSpot en vivo puedes aislar el último mes sin subir archivo.")
+    df["_periodo"] = _fechas.dt.strftime("%Y-%m")
+
 if criterio == "Solo Resolución":
     df["sin_respuesta"] = df["sr_resolucion"]
 elif criterio == "Solo Categoría":
@@ -161,15 +237,18 @@ elif criterio == "Solo Categoría":
 else:
     df["sin_respuesta"] = df["sr_resolucion"] | df["sr_categoria"]
 
-df_filt = df[df["segmento"].isin(seg_sel)
-             & df["prioridad"].fillna("Sin dato").isin(prio_sel)
-             & df["estado"].fillna("Sin dato").isin(est_sel)].copy()
+_mask = (df["segmento"].isin(seg_sel)
+         & df["prioridad"].fillna("Sin dato").isin(prio_sel)
+         & df["estado"].fillna("Sin dato").isin(est_sel))
+if mes_sel != "Todos":
+    _mask = _mask & (df["_periodo"] == mes_sel)
+df_filt = df[_mask].copy()
 df_sr = df_filt[df_filt["sin_respuesta"]].copy()
 df_view = df_sr if vista == "Solo Sin Respuesta" else df_filt
 
 # ---------------------------------------------------------------------
 st.markdown(f"""<div class="oy-header"><h1>🛠️ Dashboard de Incidencias Técnicas</h1>
-<p>Opción Yo · Corte Mayo 2026 · Fuente: export HubSpot "problemas técnicos"
+<p>Opción Yo · Fuente: <b>{origen_txt}</b> · actualizado {pd.Timestamp.now().strftime('%d/%m/%Y %H:%M')}
 &nbsp;|&nbsp; Vista: <b>{vista}</b> · {len(df_view)} tickets en pantalla</p></div>""",
     unsafe_allow_html=True)
 
@@ -393,9 +472,19 @@ with tabs[5]:
     ans_e = esp["ans_primera"].astype(str).str.lower()
     a_t = ans_e.str.contains("a tiempo").sum(); con = esp["ans_primera"].notna().sum()
     he = esp["horas_cierre"]; he = he[he>0]
+    # Tiempo REAL de 1ª respuesta (solo si la fuente es la API de HubSpot)
+    hpr = esp["horas_primera_respuesta"].dropna() if "horas_primera_respuesta" in esp else pd.Series(dtype=float)
+    hay_real = len(hpr) > 0
+    if hay_real:
+        st.success("🟢 Dato en vivo: tiempo REAL de primera respuesta disponible desde HubSpot.")
     c = st.columns(4)
     with c[0]: kpi("Tickets de especialistas", len(esp), 'contactos con "(E)"')
-    with c[1]: kpi("ANS 1ª resp. a tiempo", f'{(a_t/con*100) if con else 0:.0f}%', f'{a_t} de {con}', "green")
+    if hay_real:
+        with c[1]: kpi("Mediana 1ª respuesta", fmt_d(hpr.median()*24),
+                       f'{hpr.median():.1f} h · dato real', "green")
+    else:
+        with c[1]: kpi("ANS 1ª resp. a tiempo", f'{(a_t/con*100) if con else 0:.0f}%',
+                       f'{a_t} de {con} · cumplimiento', "green")
     with c[2]: kpi("Mediana a resolución", fmt_d(he.median()) if len(he) else "—", "creación→cierre", "blue")
     with c[3]: kpi("P90 a resolución", fmt_d(he.quantile(.9)) if len(he) else "—", "90% por debajo", "amber")
     st.markdown("####")
@@ -466,16 +555,27 @@ with tabs[6]:
 # =====================================================================
 with tabs[7]:
     st.markdown('<div class="intro">📡 Telemetría de plataforma por especialista '
-                '(sesiones). Vista <b>paralela</b>: no se cruza por nombre con los tickets '
-                'de HubSpot.</div>', unsafe_allow_html=True)
-    up_e = st.file_uploader("Reporte de especialistas (.xlsx o .csv)",
+                '(sesiones). Vista <b>paralela</b>: no vive en HubSpot, por eso va <b>por '
+                'archivo mensual</b>. Para ver otro mes (p. ej. junio), súbelo abajo; para '
+                'el corte anterior (mayo), quita el archivo y usa la muestra. Acepta '
+                'cualquier formato de mes (detecta columnas y encabezado solo).</div>',
+                unsafe_allow_html=True)
+    up_e = st.file_uploader("Reporte de especialistas (.xlsx o .csv) — NO el de HubSpot",
                             type=["xlsx","xls","csv"], key="up_esp")
+    esp_df = None
     if up_e is not None:
-        esp_df = dl.cargar_especialistas(up_e)
-    elif SAMPLE_ESP.exists():
-        esp_df = _esp(str(SAMPLE_ESP))
-    else:
-        st.warning("Sube el reporte de especialistas."); st.stop()
+        try:
+            esp_df = dl.cargar_especialistas(up_e)
+            st.success(f"✅ Reporte cargado: {up_e.name}")
+        except Exception as e:
+            st.error(f"⚠️ {e}")
+            if SAMPLE_ESP is not None:
+                st.info("Sigo mostrando la **muestra incluida** mientras tanto.")
+                esp_df = _esp(SAMPLE_ESP)
+    elif SAMPLE_ESP is not None:
+        esp_df = _esp(SAMPLE_ESP)
+    if esp_df is None:
+        st.warning("Sube el reporte de especialistas (hoja '📋 Mayo - Todos')."); st.stop()
 
     tot_c = int(esp_df["Total Citas"].sum()); tot_i = int(esp_df["Citas c/ Inc."].sum())
     n_e = int((esp_df["Tipo"]=="Especialista").sum()) if "Tipo" in esp_df else len(esp_df)
@@ -503,8 +603,8 @@ with tabs[7]:
 
     # --- NUEVO: Efectividad de pruebas técnicas ---
     pr = None
-    if SAMPLE_PRUEBAS.exists():
-        pr = _pr(str(SAMPLE_PRUEBAS))
+    if SAMPLE_PRUEBAS is not None:
+        pr = _pr(SAMPLE_PRUEBAS)
     elif up_e is not None and getattr(up_e, "name", "").lower().endswith((".xlsx", ".xls")):
         try: pr = dl.cargar_pruebas(up_e)
         except Exception: pr = None

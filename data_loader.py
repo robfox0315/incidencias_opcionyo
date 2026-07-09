@@ -40,6 +40,10 @@ COLUMNAS_CANONICAS = {
     "ans_primera":    ["estado de ans de tiempo hasta primera respuesta"],
     "rango_cierre":   ["rangos de tiempo a cierre de ticket"],
     "contacto_ids":   ["associated contact ids"],
+    "fecha_creacion": ["fecha de creacion", "fecha de creación"],
+    "propietario":    ["propietario del ticket", "ticket owner"],
+    "pipeline":       ["pipeline"],
+    "fuente":         ["fuente", "source"],
 }
 
 
@@ -95,14 +99,38 @@ def _horas_desde_hms(x) -> float:
 # ----------------------------------------------------------------------
 def cargar_tickets(origen) -> pd.DataFrame:
     """
-    Carga el export de HubSpot (xlsx o csv) y devuelve un DataFrame
-    enriquecido con columnas derivadas.
-
-    `origen` puede ser una ruta (str/Path) o un objeto file-like
-    (lo que devuelve st.file_uploader).
+    Carga el export de HubSpot (xlsx o csv) desde archivo y lo enriquece.
+    `origen` puede ser ruta o file-like (st.file_uploader).
     """
     df = _leer_tabla(origen)
+    return enriquecer_tickets(df)
+
+
+def enriquecer_tickets(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Toma un DataFrame de tickets (venga de archivo o de la API de HubSpot),
+    normaliza nombres de columna y agrega TODAS las columnas derivadas.
+    Es el punto único de verdad: archivo y API pasan por aquí, garantizando
+    que los KPIs se calculen igual sin importar la fuente.
+    """
     df = _mapear_columnas(df)
+
+    # --- VALIDACIÓN: ¿trae las columnas base? ---
+    if "contacto" not in df.columns and "resolucion" not in df.columns:
+        cols_orig = ", ".join(str(c) for c in df.columns[:8])
+        raise ValueError(
+            "Los datos NO tienen las columnas de 'problemas técnicos' "
+            "(faltan 'Associated Contact', 'Resolución', 'Descripción'…). "
+            "Si es un archivo, exporta la vista de 'problemas técnicos'. "
+            f"Columnas detectadas: {cols_orig}…"
+        )
+
+    # --- SEGURIDAD: crear columnas ausentes como vacías ---
+    for col in ["contacto", "descripcion", "prioridad", "estado", "fecha_cierre",
+                "ans_cierre", "tiempo_cierre", "respondido", "resolucion",
+                "categoria", "ans_primera", "rango_cierre", "contacto_ids"]:
+        if col not in df.columns:
+            df[col] = np.nan
 
     # --- columnas derivadas de contacto ---
     df["email"] = df["contacto"].apply(_extraer_email)
@@ -122,9 +150,27 @@ def cargar_tickets(origen) -> pd.DataFrame:
     df["segmento"] = df.apply(_segmento, axis=1)
 
     # --- tiempos ---
-    df["horas_cierre"] = df["tiempo_cierre"].apply(_horas_desde_hms)
+    # Preferimos el tiempo numérico real (viene de la API en ms). Si no está,
+    # parseamos el string HH:mm:ss del export.
+    if "ms_cierre" in df.columns and pd.to_numeric(df["ms_cierre"], errors="coerce").notna().any():
+        df["horas_cierre"] = pd.to_numeric(df["ms_cierre"], errors="coerce") / 3_600_000
+    else:
+        df["horas_cierre"] = df["tiempo_cierre"].apply(_horas_desde_hms)
+
+    # Tiempo REAL de primera respuesta (solo disponible vía API: ms_primera_resp)
+    if "ms_primera_resp" in df.columns:
+        df["horas_primera_respuesta"] = pd.to_numeric(df["ms_primera_resp"], errors="coerce") / 3_600_000
+    else:
+        df["horas_primera_respuesta"] = np.nan
+
     if "fecha_cierre" in df.columns:
-        df["fecha_cierre"] = pd.to_datetime(df["fecha_cierre"], errors="coerce")
+        # utc=True unifica tz-aware (HubSpot '…Z') y naive (CSV); tz_localize(None)
+        # las deja SIN zona horaria (Excel/openpyxl no soporta fechas con tz).
+        df["fecha_cierre"] = pd.to_datetime(
+            df["fecha_cierre"], errors="coerce", utc=True).dt.tz_localize(None)
+    if "fecha_creacion" in df.columns:
+        df["fecha_creacion"] = pd.to_datetime(
+            df["fecha_creacion"], errors="coerce", utc=True).dt.tz_localize(None)
 
     # --- bandera SIN RESPUESTA (doble criterio) ---
     resol = df["resolucion"].astype(str).str.strip().str.lower()
@@ -134,8 +180,6 @@ def cargar_tickets(origen) -> pd.DataFrame:
     df["sin_respuesta"] = df["sr_resolucion"] | df["sr_categoria"]
 
     # --- escalado a IT ---
-    # Titular = estado "Escalar a IT" (3). "Cerrado por IT" (1) se ve aparte
-    # en la distribución de Estado para no mezclar definiciones.
     est = df["estado"].astype(str).str.lower()
     df["escalado_it"] = est.str.contains("escalar a it")
     df["it_involucrado"] = est.str.contains("escalar a it") | est.str.contains("cerrado por it")
@@ -177,36 +221,86 @@ METRICAS_TELEMETRIA = [
 ]
 
 
+# Sinónimos de encabezados del reporte de especialistas (varían por mes).
+_SINONIMOS_ESP = {
+    "especialista": "Especialista", "tipo": "Tipo", "talent manager": "Talent Manager",
+    "total citas": "Total Citas",
+    "citas con incidencias": "Citas c/ Inc.", "citas c/ inc.": "Citas c/ Inc.",
+    "citas c/ inc": "Citas c/ Inc.", "citas con inc.": "Citas c/ Inc.",
+    "citas sin incidencias": "Citas Sin Inc.", "citas sin inc.": "Citas Sin Inc.",
+    "citas sin inc": "Citas Sin Inc.",
+    "% con incidencias": "% Inc.", "% inc.": "% Inc.", "% inc": "% Inc.", "% incidencias": "% Inc.",
+    "conn. loss": "Conn. loss", "conn loss": "Conn. loss",
+    "errores chime": "Err. Chime", "err. chime": "Err. Chime", "err chime": "Err. Chime",
+    "audio/video": "Audio/Video", "audio video": "Audio/Video",
+    "reloads": "Reloads", "metricas red": "Métricas red", "métricas red": "Métricas red",
+    "errores js": "Errores JS",
+    "errores generales": "Errores generales", "otros": "Otros", "acciones": "Acciones",
+}
+
+
+def _fila_encabezado(raw: pd.DataFrame):
+    """Encuentra la fila que contiene 'Especialista' (el encabezado real)."""
+    for i in range(min(6, len(raw))):
+        if "especialista" in [_slug(x) for x in raw.iloc[i].tolist()]:
+            return i
+    return None
+
+
+def _normalizar_cols_esp(df: pd.DataFrame) -> pd.DataFrame:
+    ren = {c: _SINONIMOS_ESP[_slug(c)] for c in df.columns if _slug(c) in _SINONIMOS_ESP}
+    return df.rename(columns=ren)
+
+
 def cargar_especialistas(origen, es_excel_origen: bool = False) -> pd.DataFrame:
     """
-    Carga la telemetría por especialista.
-
-    - Si recibe el CSV de muestra (data/incidencias_especialistas_mayo.csv),
-      lo lee directo.
-    - Si recibe el Excel completo de Felipe, lee la hoja '📋 Mayo - Todos'
-      cuyo encabezado está en la fila índice 1.
+    Carga la telemetría por especialista, ROBUSTA y AGNÓSTICA AL MES.
+    Detecta hoja y fila de encabezado automáticamente (mayo: 2ª fila; junio: 1ª)
+    y normaliza los nombres de columna (varían entre reportes).
     """
     nombre = getattr(origen, "name", str(origen)).lower()
     if nombre.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(origen, sheet_name="📋 Mayo - Todos", header=1)
+        xls = pd.ExcelFile(origen)
+        orden = sorted(xls.sheet_names, key=lambda s: 0 if "todos" in str(s).lower() else 1)
+        df = None
+        for s in orden:
+            raw = pd.read_excel(xls, sheet_name=s, header=None)
+            h = _fila_encabezado(raw)
+            if h is not None:
+                df = pd.read_excel(xls, sheet_name=s, header=h)
+                break
+        if df is None:
+            raise ValueError("No encontré una hoja con la columna 'Especialista'. "
+                             "¿Es el archivo del reporte de especialistas?")
     else:
         df = _leer_tabla(origen)
 
+    df = _normalizar_cols_esp(df)
     df = df.dropna(how="all")
+
+    if "Especialista" not in df.columns:
+        raise ValueError(
+            "El archivo subido no parece el 'Reporte de especialistas' "
+            "(no encontré la columna 'Especialista'). ¿Subiste por error el "
+            "export de tickets de HubSpot en este cargador?"
+        )
+
     df = df[df["Especialista"].notna()].copy()
 
-    for c in METRICAS_TELEMETRIA:
+    for c in METRICAS_TELEMETRIA + ["Errores generales", "Otros"]:
         if c in df.columns:
             df[c] = pd.to_numeric(
-                df[c].replace("-", 0).replace("–", 0), errors="coerce"
-            ).fillna(0)
+                df[c].replace("-", 0).replace("–", 0), errors="coerce").fillna(0)
 
     for c in ["Total Citas", "Citas c/ Inc.", "Citas Sin Inc."]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
     if "% Inc." in df.columns:
-        df["% Inc."] = pd.to_numeric(df["% Inc."], errors="coerce")
+        pct = pd.to_numeric(df["% Inc."], errors="coerce")
+        if pct.dropna().gt(1.5).any():   # si viene 0-100, lo paso a fracción 0-1
+            pct = pct / 100.0
+        df["% Inc."] = pct
 
     return df.reset_index(drop=True)
 
@@ -441,16 +535,22 @@ def incidencias_por_tipo(esp_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def cargar_pruebas(origen) -> pd.DataFrame:
-    """Carga el seguimiento de pruebas técnicas (CSV de muestra o Excel completo)."""
+    """Carga el seguimiento de pruebas técnicas de forma robusta."""
     nombre = getattr(origen, "name", str(origen)).lower()
     if nombre.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(origen, sheet_name="🔧 Seguimiento Pruebas", header=3)
+        xls = pd.ExcelFile(origen)
+        hoja = next((s for s in xls.sheet_names if "prueba" in str(s).lower()), None)
+        if hoja is None:
+            raise ValueError("El Excel no tiene la hoja de 'Seguimiento de Pruebas'.")
+        df = pd.read_excel(xls, sheet_name=hoja, header=3)
         df.columns = [str(c).strip() for c in df.columns]
         df = df.rename(columns={"Resultado": "Resultado inicial",
                                 "Resultado.1": "Resultado seguimiento"})
     else:
         df = _leer_tabla(origen)
     df = df.dropna(how="all")
+    if "Especialista" not in df.columns:
+        raise ValueError("El archivo no corresponde al seguimiento de pruebas.")
     df = df[df["Especialista"].notna()].copy()
     return df.reset_index(drop=True)
 
@@ -473,8 +573,24 @@ def resumen_pruebas(pr: pd.DataFrame) -> dict:
 
 
 def df_a_excel_bytes(df: pd.DataFrame, hoja: str = "Datos") -> bytes:
-    """Serializa un DataFrame a bytes de Excel (para descarga)."""
+    """Serializa un DataFrame a bytes de Excel, saneando lo que openpyxl rechaza:
+    fechas con zona horaria, valores infinitos y strings demasiado largos."""
+    safe = df.copy()
+    for c in safe.columns:
+        s = safe[c]
+        # 1) fechas con zona horaria -> sin zona
+        if isinstance(s.dtype, pd.DatetimeTZDtype):
+            safe[c] = s.dt.tz_localize(None)
+        # 2) textos (object o dtype 'str'/'string' de pandas nuevo): recortar a
+        #    32.000 (límite de celda 32.767) y quitar caracteres de control
+        elif s.dtype == object or pd.api.types.is_string_dtype(s):
+            safe[c] = s.apply(
+                lambda v: re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", str(v)[:32000])
+                if isinstance(v, str) else v)
+    # 3) infinitos -> vacío
+    safe = safe.replace([np.inf, -np.inf], np.nan)
+
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=hoja[:31])
+        safe.to_excel(writer, index=False, sheet_name=str(hoja)[:31])
     return buffer.getvalue()
