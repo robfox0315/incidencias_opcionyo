@@ -10,6 +10,54 @@ solicitado por **Felipe Higuera**. Ingiere el export de HubSpot de
 
 ---
 
+## 🏗️ Arquitectura (API-first con fallback)
+
+```
+        ┌────────────────────┐
+        │   HubSpot CRM API   │  pipeline "Problemas técnicos" (111962122)
+        └─────────┬──────────┘
+                  │  token en st.secrets["HUBSPOT_TOKEN"]  (nunca en el código)
+                  ▼
+        ┌────────────────────┐        ┌───────────────────────┐
+        │   hubspot_api.py    │        │  Archivo CSV / Excel  │  (fallback)
+        │  · search paginado  │        │  (uploader o muestra) │
+        │  · etapas + owners  │        └───────────┬───────────┘
+        │  · contactos (assoc)│                    │
+        └─────────┬──────────┘                    │
+                  ▼   DataFrame con nombres de display + tiempos reales (ms)
+             ┌─────────────────────────────────────────────┐
+             │  data_loader.enriquecer_tickets()           │  ← punto único de verdad
+             │  normaliza · valida · deriva KPIs           │
+             └──────────────────┬──────────────────────────┘
+                                ▼
+                         app.py (9 pestañas)
+```
+
+**Claves de diseño:**
+- **Una sola fuente de verdad:** archivo y API pasan por `enriquecer_tickets()`, así los KPIs se calculan idénticos sin importar el origen.
+- **Fallback siempre:** si el token falta/falla, la app degrada con gracia a la muestra o al archivo subido; nunca se rompe.
+- **Seguridad:** el token vive en Secrets, jamás en el repo (`.gitignore` excluye `secrets.toml`).
+- **Rendimiento:** las llamadas se cachean 15 min (`ttl=900`) con botón "🔄 Recargar".
+- **Ventaja de la API:** trae el **tiempo real de 1ª respuesta y de cierre** (ms), fecha de creación, propietario y fuente — datos que el export CSV no tiene.
+
+---
+
+## 🔌 Conectar HubSpot (token)
+
+1. En HubSpot: **Settings → Integrations → Private Apps** → crea/abre una app con
+   los scopes: `crm.objects.tickets.read`, `crm.objects.contacts.read`,
+   `crm.objects.owners.read`. Copia el token `pat-…`.
+2. En Streamlit Cloud: **Manage app → Settings → Secrets** y pega:
+   ```toml
+   HUBSPOT_TOKEN = "pat-tu-token-real"
+   ```
+3. En la barra lateral elige **🔌 HubSpot en vivo** y pulsa **Probar conexión**.
+
+> El token es una credencial: nunca lo pongas en el código ni en el repo. Si se
+> expone, rótalo en HubSpot y actualiza solo el Secret.
+
+---
+
 ## ✅ Cifras validadas (corte mayo 2026)
 
 Todas las métricas del dashboard fueron verificadas contra los datos reales
@@ -72,18 +120,21 @@ prioridad y estado. Todos los tiempos se muestran **en días** (1 día = 24 h).
 
 ```
 opcionyo-incidencias/
-├── app.py                         # Aplicación Streamlit (8 pestañas)
+├── app.py                         # Aplicación Streamlit (9 pestañas)
 ├── data_loader.py                 # Lógica de datos (pandas puro, validado)
+├── hubspot_api.py                 # Cliente API de HubSpot en vivo
 ├── requirements.txt               # Dependencias
-├── README.md                      # Este archivo
+├── README.md
 ├── GUIA_DESPLIEGUE_STREAMLIT.md   # Paso a paso a prueba de errores
+├── GUIA_GERENCIA.md               # Cómo presentar a gerencia
 ├── .gitignore
 ├── .streamlit/
-│   └── config.toml                # Tema de marca
+│   ├── config.toml                # Tema de marca
+│   └── secrets.toml.example       # Plantilla del token (el real va en Secrets)
 └── data/
-    ├── problemas_tecnicos_mayo.csv         # Muestra HubSpot (para arrancar)
-    ├── incidencias_especialistas_mayo.csv  # Muestra telemetría
-    └── seguimiento_pruebas_mayo.csv        # Muestra pruebas técnicas
+    ├── problemas_tecnicos_mayo.csv
+    ├── incidencias_especialistas_mayo.csv
+    └── seguimiento_pruebas_mayo.csv
 ```
 
 El dashboard **arranca con las muestras incluidas**. Para actualizar, sube tu
