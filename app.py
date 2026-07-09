@@ -577,7 +577,11 @@ with tabs[7]:
     if esp_df is None:
         st.warning("Sube el reporte de especialistas (hoja '📋 Mayo - Todos')."); st.stop()
 
-    tot_c = int(esp_df["Total Citas"].sum()); tot_i = int(esp_df["Citas c/ Inc."].sum())
+    # Acceso defensivo: si por cualquier motivo faltara una columna, no truena.
+    def _col_num(dfx, nombre):
+        return pd.to_numeric(dfx[nombre], errors="coerce").fillna(0) if nombre in dfx.columns else pd.Series([0]*len(dfx))
+    tot_c = int(_col_num(esp_df, "Total Citas").sum())
+    tot_i = int(_col_num(esp_df, "Citas c/ Inc.").sum())
     n_e = int((esp_df["Tipo"]=="Especialista").sum()) if "Tipo" in esp_df else len(esp_df)
     c = st.columns(4)
     with c[0]: kpi("Especialistas", n_e)

@@ -116,6 +116,13 @@ def enriquecer_tickets(df: pd.DataFrame) -> pd.DataFrame:
     df = _mapear_columnas(df)
 
     # --- VALIDACIÓN: ¿trae las columnas base? ---
+    _cols_slug = {_slug(c) for c in df.columns}
+    if "especialista" in _cols_slug and "contacto" not in df.columns:
+        raise ValueError(
+            "📡 Este es el REPORTE DE ESPECIALISTAS (telemetría), no el de tickets. "
+            "Súbelo en la pestaña «📡 Telemetría» (más abajo en el menú), NO aquí. "
+            "En este cargador va el export de TICKETS de HubSpot ('problemas técnicos')."
+        )
     if "contacto" not in df.columns and "resolucion" not in df.columns:
         cols_orig = ", ".join(str(c) for c in df.columns[:8])
         raise ValueError(
@@ -286,6 +293,15 @@ def cargar_especialistas(origen, es_excel_origen: bool = False) -> pd.DataFrame:
         )
 
     df = df[df["Especialista"].notna()].copy()
+
+    # Garantiza que existan las columnas clave (aunque el reporte varíe),
+    # para que la app nunca truene por un KeyError aguas abajo.
+    for c in ["Tipo", "Talent Manager"]:
+        if c not in df.columns:
+            df[c] = ""
+    for c in ["Total Citas", "Citas c/ Inc.", "Citas Sin Inc.", "% Inc."]:
+        if c not in df.columns:
+            df[c] = 0
 
     for c in METRICAS_TELEMETRIA + ["Errores generales", "Otros"]:
         if c in df.columns:
